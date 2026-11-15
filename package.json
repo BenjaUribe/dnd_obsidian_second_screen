@@ -1,0 +1,19 @@
+{
+  "name": "dnd-5e-live-vault-hud",
+  "version": "1.0.0",
+  "private": true,
+  "description": "D&D 5e Live Vault HUD - Second Screen en tiempo real para bóveda de Obsidian",
+  "scripts": {
+    "install:all": "npm install && npm --prefix server install && npm --prefix client install",
+    "dev": "concurrently -n \"SERVER,CLIENT\" -c \"cyan,magenta\" \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "build:server": "npm --prefix server run build",
+    "build:client": "npm --prefix client run build",
+    "build": "npm run build:server && npm run build:client"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
+
