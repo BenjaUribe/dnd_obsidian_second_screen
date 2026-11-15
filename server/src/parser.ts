@@ -220,21 +220,38 @@ const KNOWN_CONDITIONS = [
   'Agotamiento',
 ];
 
+function cleanConditionLabel(raw: string): string {
+  return raw
+    .replace(/\*\*/g, '')
+    .replace(/^\[\[|\]\]$/g, '')
+    .replace(/^\[|\]$/g, '')
+    .split('|')[0]
+    .trim();
+}
+
+function addCleanCondition(target: string[], raw: string): void {
+  const cleaned = cleanConditionLabel(raw);
+  if (!cleaned) return;
+  const lower = cleaned.toLowerCase();
+  if (lower === 'ninguno' || lower === 'ninguna' || lower === 'normal' || lower === '-' || lower === '—') {
+    return;
+  }
+  if (!target.some((c) => c.toLowerCase() === lower)) {
+    target.push(cleaned);
+  }
+}
+
 function extractConditions(content: string, frontmatter: Record<string, unknown>): string[] {
-  const conditions = new Set<string>();
+  const conditions: string[] = [];
 
   // 1. Frontmatter: estados / conditions / estado
   const fmCond = frontmatter.estados ?? frontmatter.estado ?? frontmatter.conditions;
   if (Array.isArray(fmCond)) {
     fmCond.forEach((c) => {
-      if (typeof c === 'string' && c.trim()) conditions.add(c.trim());
+      if (typeof c === 'string') addCleanCondition(conditions, c);
     });
   } else if (typeof fmCond === 'string' && fmCond.trim()) {
-    splitListItems(fmCond).forEach((c) => {
-      if (c.toLowerCase() !== 'ninguno' && c.toLowerCase() !== 'normal') {
-        conditions.add(c);
-      }
-    });
+    splitListItems(fmCond).forEach((c) => addCleanCondition(conditions, c));
   }
 
   // 2. Bullet en el cuerpo: "- **Estados:** ..." o "- **Estados Activos:** ..."
@@ -246,14 +263,10 @@ function extractConditions(content: string, frontmatter: Record<string, unknown>
     'Condiciones',
   ]);
   if (bodyField) {
-    splitListItems(bodyField).forEach((c) => {
-      if (c.toLowerCase() !== 'ninguno' && c.toLowerCase() !== 'normal' && c !== '-') {
-        conditions.add(c);
-      }
-    });
+    splitListItems(bodyField).forEach((c) => addCleanCondition(conditions, c));
   }
 
-  return Array.from(conditions);
+  return conditions;
 }
 
 /**
@@ -605,12 +618,31 @@ export function parseCharacterFile(filePath: string): CharacterSheet {
   let deathSuccesses = 0;
   let deathFailures = 0;
   if (deathLine) {
-    const [succPart, failPart] = deathLine.split(/Fallos/i);
-    if (succPart) {
-      deathSuccesses = Math.min(3, (succPart.match(/\[x\]/gi) || []).length);
-    }
-    if (failPart) {
-      deathFailures = Math.min(3, (failPart.match(/\[x\]/gi) || []).length);
+    const parseDeathSegment = (seg: string): number => {
+      if (!seg) return 0;
+      // Soporta [x], [X], [✓], [✔], [✅], [v], ✅, ✓, ✔
+      const boxMatches = seg.match(/\[(?:x|✓|✔|✅|v)\]|✅|✓|✔/gi);
+      if (boxMatches && boxMatches.length > 0) {
+        return Math.min(3, boxMatches.length);
+      }
+      // Fallback por si el DM escribió "Éxitos: 2" o "2/3"
+      const numMatch = seg.match(/(\d+)(?:\s*\/\s*3)?/);
+      if (numMatch) {
+        return Math.min(3, Math.max(0, parseInt(numMatch[1], 10)));
+      }
+      return 0;
+    };
+
+    const succMatch = deathLine.match(/[ÉE]xitos?\s*:?\s*([^|\n]+)/i);
+    const failMatch = deathLine.match(/Fallos?\s*:?\s*([^|\n]+)/i);
+
+    if (succMatch || failMatch) {
+      deathSuccesses = succMatch ? parseDeathSegment(succMatch[1]) : 0;
+      deathFailures = failMatch ? parseDeathSegment(failMatch[1]) : 0;
+    } else {
+      const [succPart, failPart] = deathLine.split(/Fallos?/i);
+      deathSuccesses = parseDeathSegment(succPart || '');
+      deathFailures = parseDeathSegment(failPart || '');
     }
   }
 
@@ -1731,30 +1763,110 @@ export function parseVault(vaultPath: string, lastChangedFile?: string): VaultSt
   const characterFiles = walkMarkdownFiles(charactersDir, ['_']);
   const characters: CharacterSheet[] = characterFiles.map((fp) => parseCharacterFile(fp));
 
-  // Sincronizar HP/estados con `## 👥 Grupo Activo` de la sesión activa si están reportados ahí
-  if (activeSession && activeSession.activeParty.length > 0) {
-    for (const char of characters) {
-      const partyMatch = activeSession.activeParty.find(
-        (p) =>
-          normalizeEntityKey(p.name) === normalizeEntityKey(char.fileName) ||
-          normalizeEntityKey(p.name) === normalizeEntityKey(char.name)
+  // Sincronización bidireccional (el archivo modificado más recientemente manda) entre Personajes/*.md,
+  // `## 🛡️ Estado del Grupo y Recursos` y `## ⚔️ Rastreador de Combate e Iniciativa`
+  if (activeSession) {
+    let sessionMtime = 0;
+    try {
+      sessionMtime = fs.statSync(activeSession.filePath).mtimeMs;
+    } catch {
+      sessionMtime = 0;
+    }
+
+    const matchesCharacter = (rawLabel: string, char: CharacterSheet): boolean => {
+      const key = normalizeEntityKey(rawLabel.replace(/\*\*/g, ''));
+      if (!key) return false;
+      const fnKey = normalizeEntityKey(char.fileName);
+      const nameKey = normalizeEntityKey(char.name);
+      const firstToken = nameKey.split(/\s+/)[0];
+      return (
+        key === fnKey ||
+        key === nameKey ||
+        (firstToken.length >= 3 && key === firstToken)
       );
-      if (partyMatch) {
+    };
+
+    for (const char of characters) {
+      let charMtime = 0;
+      try {
+        charMtime = fs.statSync(char.filePath).mtimeMs;
+      } catch {
+        charMtime = 0;
+      }
+
+      const trackerRow = activeSession.combatTracker.find((row) =>
+        matchesCharacter(row.combatant, char)
+      );
+      const partyRow = activeSession.partyResources.find((row) =>
+        matchesCharacter(row.character, char)
+      );
+      const activePartyEntry = activeSession.activeParty.find((p) =>
+        matchesCharacter(p.name, char)
+      );
+
+      const sessionIsNewer = sessionMtime > charMtime + 500;
+
+      if (sessionIsNewer && (trackerRow || partyRow)) {
+        // La sesión se actualizó más recientemente (ej. en pleno combate): actualizar ficha en memoria
+        const hpSource = trackerRow?.hp || partyRow?.hp || '';
+        const hpMatch = hpSource.match(/(\d+)\s*\/\s*(\d+)/);
+        if (hpMatch) {
+          char.hpCurrent = parseInt(hpMatch[1], 10);
+          char.hpMax = parseInt(hpMatch[2], 10);
+        } else if (/^\d+$/.test(hpSource.trim())) {
+          char.hpCurrent = parseInt(hpSource.trim(), 10);
+        }
+
+        const acSource = trackerRow?.ac || partyRow?.ac || '';
+        const acMatch = acSource.match(/(\d+)/);
+        if (acMatch) {
+          char.ac = parseInt(acMatch[1], 10);
+        }
+
+        const condSource = trackerRow?.conditions || partyRow?.conditions || '';
+        if (condSource) {
+          const parsedConds: string[] = [];
+          splitListItems(condSource).forEach((c) => addCleanCondition(parsedConds, c));
+          if (parsedConds.length > 0 || /ninguno|ninguna|—|-/i.test(condSource)) {
+            char.conditions = parsedConds;
+          }
+        }
+      } else if (activePartyEntry) {
+        // Fallback legado para fichas sin HP propio
         if (
-          typeof partyMatch.hpCurrent === 'number' &&
+          typeof activePartyEntry.hpCurrent === 'number' &&
           char.frontmatter.hp_actual === undefined &&
           !/HP\s*:\s*\d+\s*\/\s*\d+/i.test(char.rawContent)
         ) {
-          char.hpCurrent = partyMatch.hpCurrent;
+          char.hpCurrent = activePartyEntry.hpCurrent;
         }
-        if (typeof partyMatch.hpMax === 'number' && !char.frontmatter.hp_max) {
-          char.hpMax = partyMatch.hpMax;
+        if (typeof activePartyEntry.hpMax === 'number' && !char.frontmatter.hp_max) {
+          char.hpMax = activePartyEntry.hpMax;
         }
-        if (partyMatch.conditions && partyMatch.conditions.length > 0) {
-          for (const c of partyMatch.conditions) {
-            if (!char.conditions.includes(c)) char.conditions.push(c);
+        if (activePartyEntry.conditions && activePartyEntry.conditions.length > 0) {
+          for (const c of activePartyEntry.conditions) {
+            addCleanCondition(char.conditions, c);
           }
         }
+      }
+
+      // Asegurar coherencia de Inconsciente cuando HP <= 0
+      if (char.hpCurrent <= 0) {
+        addCleanCondition(char.conditions, 'Inconsciente');
+      } else {
+        char.conditions = char.conditions.filter(
+          (c) => c.toLowerCase() !== 'inconsciente' || sessionIsNewer
+        );
+      }
+
+      // Proyectar siempre el estado unificado hacia la fila del Rastreador de Combate
+      if (trackerRow) {
+        trackerRow.hp = `${char.hpCurrent} / ${char.hpMax}${
+          char.hpTemp > 0 ? ` (+${char.hpTemp})` : ''
+        }`;
+        trackerRow.ac = `${char.ac}`;
+        trackerRow.conditions =
+          char.conditions.length > 0 ? char.conditions.join(', ') : 'Ninguno';
       }
     }
   }
