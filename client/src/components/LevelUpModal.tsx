@@ -316,7 +316,7 @@ export const LevelUpModal: React.FC<LevelUpModalProps> = ({
     }
 
     lines.push(
-      `- Finalmente, registra brevemente esta subida a Nivel ${targetLevel} en la bitácora de la sesión activa (\`Campaña/Sesiones/\`).`
+      `- Finalmente, registra brevemente esta subida a Nivel ${targetLevel} en la bitácora de la sesión activa (\`Sesiones/\`).`
     );
 
     onConfirmLevelUp(lines.join('\n'));

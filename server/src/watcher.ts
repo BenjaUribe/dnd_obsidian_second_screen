@@ -8,24 +8,45 @@ export type VaultUpdateCallback = (state: VaultState, event: string, filePath: s
 
 export class VaultWatcher {
   private vaultPath: string;
+  private activeCampaign: string | undefined;
   private watcher: FSWatcher | null = null;
   private currentState: VaultState;
   private listeners: Set<VaultUpdateCallback> = new Set();
   private debounceTimer: NodeJS.Timeout | null = null;
 
-  constructor(vaultPath: string) {
+  constructor(vaultPath: string, initialCampaign?: string) {
     this.vaultPath = vaultPath;
-    this.currentState = parseVault(this.vaultPath);
+    this.activeCampaign = initialCampaign;
+    this.currentState = parseVault(this.vaultPath, this.activeCampaign);
+    this.activeCampaign = this.currentState.activeCampaign;
   }
 
-  public getState(): VaultState {
+  public getState(campaign?: string): VaultState {
+    const requested = campaign?.trim();
+    if (requested && requested !== this.currentState.activeCampaign) {
+      return this.setActiveCampaign(requested);
+    }
     return this.currentState;
   }
 
-  public refresh(changedFile?: string): VaultState {
+  public getActiveCampaign(): string {
+    return this.currentState.activeCampaign;
+  }
+
+  public setActiveCampaign(campaign?: string): VaultState {
+    const requested = campaign?.trim();
+    if (requested) {
+      this.activeCampaign = requested;
+    }
+    return this.refresh('campaign-switch');
+  }
+
+  public refresh(changedFile?: string, campaign?: string): VaultState {
     try {
-      const nextState = parseVault(this.vaultPath, changedFile);
+      const targetCampaign = campaign?.trim() || this.activeCampaign;
+      const nextState = parseVault(this.vaultPath, targetCampaign, changedFile);
       this.currentState = nextState;
+      this.activeCampaign = nextState.activeCampaign;
       return this.currentState;
     } catch (err) {
       console.error(
@@ -98,10 +119,33 @@ export class VaultWatcher {
       }, 60);
     };
 
+    const handleDirEvent = (event: 'addDir' | 'unlinkDir', fullPath: string) => {
+      const relativePath = path.relative(this.vaultPath, fullPath).replace(/\\/g, '/');
+      if (!/^Campa(ñ|n)as?\//i.test(relativePath)) return;
+
+      if (this.debounceTimer) {
+        clearTimeout(this.debounceTimer);
+      }
+
+      this.debounceTimer = setTimeout(() => {
+        try {
+          console.log(`[Watcher] Evento de carpeta '${event}' detectado en: ${relativePath}`);
+          const nextState = this.refresh(relativePath);
+          for (const listener of this.listeners) {
+            listener(nextState, event, relativePath);
+          }
+        } catch (err) {
+          console.error(`[Watcher] Error al re-parsear tras cambio de carpeta en ${relativePath}:`, err);
+        }
+      }, 60);
+    };
+
     this.watcher
       .on('add', (fp) => handleFileEvent('add', fp))
       .on('change', (fp) => handleFileEvent('change', fp))
       .on('unlink', (fp) => handleFileEvent('unlink', fp))
+      .on('addDir', (fp) => handleDirEvent('addDir', fp))
+      .on('unlinkDir', (fp) => handleDirEvent('unlinkDir', fp))
       .on('error', (err) => console.error('[Watcher] Error en chokidar:', err));
   }
 

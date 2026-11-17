@@ -206,7 +206,7 @@ export const SessionFeed: React.FC<SessionFeedProps> = ({
       <section className="rounded-xl border border-slate-800 bg-slate-900/70 p-8 text-center">
         <p className="text-slate-300 text-sm">
           No hay ninguna sesión registrada en{' '}
-          <code className="text-amber-300">Campaña/Sesiones/</code>.
+          <code className="text-amber-300">Sesiones/</code> de la campaña activa.
         </p>
       </section>
     );

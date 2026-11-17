@@ -21,7 +21,7 @@ app.use(express.json());
 const vaultWatcher = new VaultWatcher(VAULT_PATH);
 vaultWatcher.start();
 
-const agyRunner = new AgyRunner(VAULT_PATH);
+const agyRunner = new AgyRunner(VAULT_PATH, vaultWatcher.getActiveCampaign());
 
 // Conjunto de clientes SSE activos
 const sseClients = new Set<Response>();
@@ -34,6 +34,8 @@ app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     vaultPath: VAULT_PATH,
+    activeCampaign: state.activeCampaign,
+    campaigns: state.campaigns,
     lastUpdated: state.lastUpdated,
     stats: {
       characters: state.characters.length,
@@ -47,24 +49,55 @@ app.get('/api/health', (_req: Request, res: Response) => {
 });
 
 /**
- * Carga inicial del estado completo de la bóveda
+ * Carga inicial del estado completo de la bóveda (soporta ?campaign=...)
  */
-app.get('/api/vault', (_req: Request, res: Response) => {
-  res.json(vaultWatcher.getState());
+app.get('/api/vault', (req: Request, res: Response) => {
+  const requestedCampaign =
+    typeof req.query.campaign === 'string' && req.query.campaign.trim()
+      ? req.query.campaign.trim()
+      : undefined;
+
+  const prevCampaign = vaultWatcher.getActiveCampaign();
+  const state = requestedCampaign
+    ? vaultWatcher.setActiveCampaign(requestedCampaign)
+    : vaultWatcher.getState();
+
+  agyRunner.setActiveCampaign(state.activeCampaign);
+
+  if (requestedCampaign && state.activeCampaign !== prevCampaign) {
+    broadcastVaultState(state, 'campaign-switch', `Campañas/${state.activeCampaign}`);
+  }
+
+  res.json(state);
 });
 
 /**
  * Fuerza una recarga manual del estado de la bóveda
  */
-app.post('/api/refresh', (_req: Request, res: Response) => {
-  const state = vaultWatcher.refresh('manual-refresh');
+app.post('/api/refresh', (req: Request, res: Response) => {
+  const requestedCampaign =
+    (typeof req.body?.campaign === 'string' && req.body.campaign.trim()) ||
+    (typeof req.query.campaign === 'string' && req.query.campaign.trim()) ||
+    undefined;
+  const state = vaultWatcher.refresh('manual-refresh', requestedCampaign);
+  agyRunner.setActiveCampaign(state.activeCampaign);
   res.json(state);
 });
 
 /**
- * Stream Server-Sent Events (SSE) para sincronización en tiempo real
+ * Stream Server-Sent Events (SSE) para sincronización en tiempo real (soporta ?campaign=...)
  */
 app.get('/api/events', (req: Request, res: Response) => {
+  const requestedCampaign =
+    typeof req.query.campaign === 'string' && req.query.campaign.trim()
+      ? req.query.campaign.trim()
+      : undefined;
+
+  const state = requestedCampaign
+    ? vaultWatcher.setActiveCampaign(requestedCampaign)
+    : vaultWatcher.getState();
+  agyRunner.setActiveCampaign(state.activeCampaign);
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
@@ -76,7 +109,7 @@ app.get('/api/events', (req: Request, res: Response) => {
   const initialPayload = JSON.stringify({
     type: 'initial',
     timestamp: new Date().toISOString(),
-    state: vaultWatcher.getState(),
+    state,
   });
   res.write(`event: vault-update\ndata: ${initialPayload}\n\n`);
 
@@ -97,6 +130,30 @@ const server = http.createServer(app);
 
 // Soporte dual: también exponemos WebSockets en ws://localhost:3001/ws
 const wss = new WebSocketServer({ server, path: '/ws' });
+
+function broadcastVaultState(
+  state: ReturnType<typeof vaultWatcher.getState>,
+  event: string,
+  filePath: string
+): void {
+  const message = JSON.stringify({
+    type: 'update',
+    event,
+    filePath,
+    timestamp: new Date().toISOString(),
+    state,
+  });
+
+  for (const client of sseClients) {
+    client.write(`event: vault-update\ndata: ${message}\n\n`);
+  }
+
+  for (const wsClient of wss.clients) {
+    if (wsClient.readyState === WebSocket.OPEN) {
+      wsClient.send(message);
+    }
+  }
+}
 
 function broadcastDmEvent(evt: DmStreamEvent): void {
   const sseData = JSON.stringify(evt);
@@ -139,10 +196,11 @@ app.post('/api/dm/abort', (_req: Request, res: Response) => {
  * Envía un prompt al Dungeon Master (agy) y transmite la respuesta por SSE y WebSocket
  */
 app.post('/api/dm/prompt', (req: Request, res: Response) => {
-  const { prompt, newSession, conversationId } = req.body as {
+  const { prompt, newSession, conversationId, campaign } = req.body as {
     prompt?: string;
     newSession?: boolean;
     conversationId?: string;
+    campaign?: string;
   };
 
   if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
@@ -157,9 +215,13 @@ app.post('/api/dm/prompt', (req: Request, res: Response) => {
     return;
   }
 
+  const activeCampaign =
+    (typeof campaign === 'string' && campaign.trim()) ||
+    vaultWatcher.getActiveCampaign();
+
   // Ejecutar en segundo plano y emitir eventos en streaming
   agyRunner
-    .runPrompt(prompt, { newSession, conversationId }, (evt) => {
+    .runPrompt(prompt, { newSession, conversationId, activeCampaign }, (evt) => {
       broadcastDmEvent(evt);
     })
     .catch((err) => {
@@ -172,37 +234,57 @@ app.post('/api/dm/prompt', (req: Request, res: Response) => {
   res.status(202).json({ ok: true, status: 'started' });
 });
 
-wss.on('connection', (ws: WebSocket) => {
+wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
+  let requestedCampaign: string | undefined;
+  try {
+    const parsedUrl = new URL(req.url || '', `http://localhost:${PORT}`);
+    const campParam = parsedUrl.searchParams.get('campaign');
+    if (campParam && campParam.trim()) {
+      requestedCampaign = campParam.trim();
+    }
+  } catch {
+    // Ignorar error de URL malformada
+  }
+
+  const state = requestedCampaign
+    ? vaultWatcher.setActiveCampaign(requestedCampaign)
+    : vaultWatcher.getState();
+  agyRunner.setActiveCampaign(state.activeCampaign);
+
   ws.send(
     JSON.stringify({
       type: 'initial',
       timestamp: new Date().toISOString(),
-      state: vaultWatcher.getState(),
+      state,
     })
   );
+
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(String(raw)) as { type?: string; campaign?: string };
+      if (
+        (msg.type === 'set-campaign' || msg.type === 'select-campaign') &&
+        typeof msg.campaign === 'string' &&
+        msg.campaign.trim()
+      ) {
+        const nextState = vaultWatcher.setActiveCampaign(msg.campaign.trim());
+        agyRunner.setActiveCampaign(nextState.activeCampaign);
+        broadcastVaultState(
+          nextState,
+          'campaign-switch',
+          `Campañas/${nextState.activeCampaign}`
+        );
+      }
+    } catch {
+      // Ignorar mensajes no JSON
+    }
+  });
 });
 
 // Emitir actualizaciones tanto por SSE como por WebSocket cuando Chokidar detecte cambios
 vaultWatcher.onUpdate((state, event, filePath) => {
-  const message = JSON.stringify({
-    type: 'update',
-    event,
-    filePath,
-    timestamp: new Date().toISOString(),
-    state,
-  });
-
-  // 1. Notificar clientes SSE
-  for (const client of sseClients) {
-    client.write(`event: vault-update\ndata: ${message}\n\n`);
-  }
-
-  // 2. Notificar clientes WebSocket
-  for (const wsClient of wss.clients) {
-    if (wsClient.readyState === WebSocket.OPEN) {
-      wsClient.send(message);
-    }
-  }
+  agyRunner.setActiveCampaign(state.activeCampaign);
+  broadcastVaultState(state, event, filePath);
 });
 
 server.listen(PORT, () => {
@@ -213,6 +295,9 @@ server.listen(PORT, () => {
   console.log(`⚡ SSE Stream: http://localhost:${PORT}/api/events`);
   console.log(`🔌 WebSocket:  ws://localhost:${PORT}/ws`);
   console.log(`📂 Bóveda:     ${VAULT_PATH}`);
+  console.log(
+    `🏕️ Campaña:    ${state.activeCampaign || '(ninguna)'} (${state.campaigns.length} disponibles)`
+  );
   console.log(
     `📊 Indexados:  ${state.characters.length} PJs | ${state.sessions.length} Sesiones | ${state.quests.length} Misiones | ${state.entityList.length} Entidades`
   );

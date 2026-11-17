@@ -1639,11 +1639,56 @@ function parseBestiaryOrLoot(
   return { bestiaryData: null, lootData: null };
 }
 
+const LEGACY_SUBFOLDERS = new Set(['sesiones', 'personajes', 'mundo']);
+
 /**
- * Parsea los archivos de `Mundo/Lugares/*.md` para construir el grafo Point-Crawl `mapa: { nodos, aristas }`
+ * Resuelve el directorio contenedor de campañas soportando tanto `Campañas/` (plural) como `Campaña/` (singular).
  */
-export function parseWorldMap(vaultPath: string): WorldMapGraph {
-  const lugaresDir = path.join(vaultPath, 'Mundo', 'Lugares');
+export function resolveCampaignsDir(vaultPath: string): {
+  dirPath: string;
+  folderName: string;
+} {
+  const candidates = ['Campañas', 'Campaña', 'Campanas', 'Campana'];
+  for (const folderName of candidates) {
+    const full = path.join(vaultPath, folderName);
+    if (fs.existsSync(full)) {
+      return { dirPath: full, folderName };
+    }
+  }
+  return { dirPath: path.join(vaultPath, 'Campañas'), folderName: 'Campañas' };
+}
+
+/**
+ * Escanea los directorios dentro de `VAULT_PATH/Campañas/` (o `Campaña/`) para devolver la lista de campañas disponibles.
+ */
+export function listCampaigns(vaultPath: string): string[] {
+  const { dirPath: campaignsDir } = resolveCampaignsDir(vaultPath);
+  if (!fs.existsSync(campaignsDir)) return [];
+
+  try {
+    const entries = fs.readdirSync(campaignsDir, { withFileTypes: true });
+    return entries
+      .filter(
+        (entry) =>
+          entry.isDirectory() &&
+          !entry.name.startsWith('.') &&
+          !entry.name.startsWith('_') &&
+          !LEGACY_SUBFOLDERS.has(entry.name.toLowerCase())
+      )
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+  } catch (err) {
+    console.error(`[Parser] Error escaneando campañas en ${campaignsDir}:`, err);
+    return [];
+  }
+}
+
+/**
+ * Parsea los archivos de `Mundo/Lugares/*.md` (relativos a la raíz de la campaña activa)
+ * para construir el grafo Point-Crawl `mapa: { nodos, aristas }`
+ */
+export function parseWorldMap(campaignRoot: string): WorldMapGraph {
+  const lugaresDir = path.join(campaignRoot, 'Mundo', 'Lugares');
   const placeFiles = walkMarkdownFiles(lugaresDir, ['_', 'Plantilla']);
 
   const nodesMap = new Map<string, MapNode>();
@@ -1743,14 +1788,32 @@ export function parseWorldMap(vaultPath: string): WorldMapGraph {
 }
 
 /**
- * Parsea toda la bóveda en `vaultPath` y devuelve un `VaultState` completo y tipado
+ * Parsea toda la bóveda en `vaultPath` para la campaña activa y devuelve un `VaultState` completo y tipado
  */
-export function parseVault(vaultPath: string, lastChangedFile?: string): VaultState {
+export function parseVault(
+  vaultPath: string,
+  requestedCampaign?: string,
+  lastChangedFile?: string
+): VaultState {
   const entities: Record<string, VaultEntity> = {};
   const entityList: VaultEntity[] = [];
 
-  // 1. Parsear Sesiones (`Campaña/Sesiones/*.md`), ignorando `Plantilla_Sesion.md` y archivos con `_`
-  const sessionsDir = path.join(vaultPath, 'Campaña', 'Sesiones');
+  const { dirPath: campaignsDir } = resolveCampaignsDir(vaultPath);
+  const campaigns = listCampaigns(vaultPath);
+  const activeCampaign =
+    requestedCampaign && campaigns.includes(requestedCampaign)
+      ? requestedCampaign
+      : campaigns[0] || requestedCampaign || '';
+
+  const campaignRoot = activeCampaign
+    ? path.join(campaignsDir, activeCampaign)
+    : vaultPath;
+
+  // 1. Parsear Sesiones (`Campañas/${activeCampaign}/Sesiones/*.md`), ignorando `Plantilla_Sesion.md` y archivos con `_`
+  let sessionsDir = path.join(campaignRoot, 'Sesiones');
+  if (!fs.existsSync(sessionsDir) && fs.existsSync(path.join(campaignRoot, 'Campaña', 'Sesiones'))) {
+    sessionsDir = path.join(campaignRoot, 'Campaña', 'Sesiones');
+  }
   const sessionFiles = walkMarkdownFiles(sessionsDir, ['_', 'Plantilla']);
   const sessions: SessionLog[] = sessionFiles
     .map((fp) => parseSessionFile(fp))
@@ -1758,9 +1821,9 @@ export function parseVault(vaultPath: string, lastChangedFile?: string): VaultSt
 
   const activeSession: SessionLog | null = sessions.length > 0 ? sessions[0] : null;
 
-  // 2. Parsear Personajes (`Personajes/*.md`, ignorando `_Plantilla_PJ.md`)
-  const charactersDir = path.join(vaultPath, 'Personajes');
-  const characterFiles = walkMarkdownFiles(charactersDir, ['_']);
+  // 2. Parsear Personajes (`Campañas/${activeCampaign}/Personajes/*.md`, ignorando plantillas y archivos con `_`)
+  const charactersDir = path.join(campaignRoot, 'Personajes');
+  const characterFiles = walkMarkdownFiles(charactersDir, ['_', 'Plantilla']);
   const characters: CharacterSheet[] = characterFiles.map((fp) => parseCharacterFile(fp));
 
   // Sincronización bidireccional (el archivo modificado más recientemente manda) entre Personajes/*.md,
@@ -1886,9 +1949,9 @@ export function parseVault(vaultPath: string, lastChangedFile?: string): VaultSt
     });
   }
 
-  // 3. Indexar todas las notas de `Mundo/**/*.md`
-  const mundoDir = path.join(vaultPath, 'Mundo');
-  const mundoFiles = walkMarkdownFiles(mundoDir, ['_']);
+  // 3. Indexar todas las notas de `Campañas/${activeCampaign}/Mundo/**/*.md`
+  const mundoDir = path.join(campaignRoot, 'Mundo');
+  const mundoFiles = walkMarkdownFiles(mundoDir, ['_', 'Plantilla']);
   for (const fp of mundoFiles) {
     const fileName = path.basename(fp, '.md');
     const relFromMundo = path.relative(mundoDir, fp).replace(/\\/g, '/');
@@ -1944,11 +2007,14 @@ export function parseVault(vaultPath: string, lastChangedFile?: string): VaultSt
     });
   }
 
-  // 4. Parsear Misiones (`Campaña/Tramas_Activas.md`)
-  const questsPath = path.join(vaultPath, 'Campaña', 'Tramas_Activas.md');
+  // 4. Parsear Misiones (`Campañas/${activeCampaign}/Tramas_Activas.md`)
+  let questsPath = path.join(campaignRoot, 'Tramas_Activas.md');
+  if (!fs.existsSync(questsPath) && fs.existsSync(path.join(campaignRoot, 'Campaña', 'Tramas_Activas.md'))) {
+    questsPath = path.join(campaignRoot, 'Campaña', 'Tramas_Activas.md');
+  }
   const quests = parseQuestsFile(questsPath);
 
-  // 5. Parsear Reglas (`00_Sistema/Reglas/Motor_Reglas_5e.md`) e indexar sus secciones
+  // 5. Parsear Reglas (`00_Sistema/Reglas/Motor_Reglas_5e.md`) e indexar sus secciones (referencia global compartida)
   const rulesPath = path.join(vaultPath, '00_Sistema', 'Reglas', 'Motor_Reglas_5e.md');
   const rules = parseRulesFile(rulesPath);
   if (rules) {
@@ -1967,11 +2033,13 @@ export function parseVault(vaultPath: string, lastChangedFile?: string): VaultSt
     }
   }
 
-  // 6. Parsear Grafo de Mapa de Rutas Point-Crawl (`Mundo/Lugares/*.md`)
-  const mapa = parseWorldMap(vaultPath);
+  // 6. Parsear Grafo de Mapa de Rutas Point-Crawl (`Campañas/${activeCampaign}/Mundo/Lugares/*.md`)
+  const mapa = parseWorldMap(campaignRoot);
 
   return {
     vaultPath,
+    campaigns,
+    activeCampaign,
     lastUpdated: new Date().toISOString(),
     lastChangedFile,
     characters,

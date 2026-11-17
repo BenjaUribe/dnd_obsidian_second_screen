@@ -11,6 +11,7 @@ export type DmStreamEvent =
 export interface RunPromptOptions {
   newSession?: boolean;
   conversationId?: string;
+  activeCampaign?: string;
 }
 
 /**
@@ -39,23 +40,36 @@ function formatToolLabel(toolName: string, input?: Record<string, unknown>): str
 
 export class AgyRunner {
   private vaultPath: string;
+  private activeCampaign = '';
   private isProcessing = false;
   private activeConversationId: string | null = null;
+  private forceNewSession = false;
   private currentChild: ChildProcess | null = null;
 
-  constructor(vaultPath: string) {
+  constructor(vaultPath: string, initialCampaign = '') {
     this.vaultPath = vaultPath;
+    this.activeCampaign = initialCampaign;
   }
 
-  public getStatus(): { isProcessing: boolean; activeConversationId: string | null } {
+  public setActiveCampaign(campaign: string): void {
+    this.activeCampaign = campaign;
+  }
+
+  public getStatus(): {
+    isProcessing: boolean;
+    activeConversationId: string | null;
+    activeCampaign: string;
+  } {
     return {
       isProcessing: this.isProcessing,
       activeConversationId: this.activeConversationId,
+      activeCampaign: this.activeCampaign,
     };
   }
 
   public resetSession(): void {
     this.activeConversationId = null;
+    this.forceNewSession = true;
   }
 
   public abort(): boolean {
@@ -86,15 +100,27 @@ export class AgyRunner {
 
     this.isProcessing = true;
 
-    const isNewSession = Boolean(options.newSession);
+    const isNewSession = Boolean(options.newSession) || this.forceNewSession;
     if (isNewSession) {
       this.activeConversationId = null;
+      this.forceNewSession = false;
     }
 
     const targetConvId = options.conversationId || this.activeConversationId;
+    const campaignName = (options.activeCampaign ?? this.activeCampaign).trim();
+    if (campaignName) {
+      this.activeCampaign = campaignName;
+    }
+
+    // Cuando se envía un prompt en una conversación nueva (sin -c / --continue),
+    // anteponer automáticamente el contexto oculto de la campaña activa
+    const promptWithContext =
+      isNewSession && campaignName && !cleanPrompt.startsWith('[Campaña Activa:')
+        ? `[Campaña Activa: Campañas/${campaignName}] ${cleanPrompt}`
+        : cleanPrompt;
 
     // Escapar comillas y saltos de línea para compatibilidad con cmd.exe (shell: true en Windows)
-    const safePromptArg = cleanPrompt
+    const safePromptArg = promptWithContext
       .replace(/\r?\n+/g, ' ')
       .replace(/"/g, '\\"');
 

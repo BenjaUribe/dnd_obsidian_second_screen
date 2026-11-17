@@ -9,6 +9,7 @@ import {
   ChevronDown,
   ChevronUp,
   RotateCcw,
+  RefreshCw,
   Square,
   MessageSquare,
   Dices,
@@ -23,7 +24,7 @@ import {
 
 export interface DmChatMessage {
   id: string;
-  role: 'player' | 'dm' | 'error';
+  role: 'player' | 'dm' | 'error' | 'system';
   content: string;
   timestamp: string;
 }
@@ -33,12 +34,76 @@ interface DmChatPanelProps {
   isProcessing: boolean;
   activeToolLabel: string | null;
   conversationId: string | null;
+  activeCampaign?: string;
   isOpen: boolean;
   onToggleOpen: () => void;
   onSendPrompt: (prompt: string, newSession?: boolean) => Promise<void>;
+  onRefreshContext: () => Promise<void>;
   onResetSession: () => Promise<void>;
   onAbort: () => Promise<void>;
 }
+
+const REMARK_PLUGINS = [remarkGfm];
+
+const ChatMessageBubble = React.memo<{
+  msg: DmChatMessage;
+  largeFont: boolean;
+}>(({ msg, largeFont }) => {
+  if (msg.role === 'system') {
+    return (
+      <div className="flex items-center justify-center py-1">
+        <span className="px-3 py-1 rounded-full bg-slate-800/80 border border-slate-700/80 text-[11px] font-mono text-slate-300 text-center">
+          {msg.content}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`flex flex-col ${
+        msg.role === 'player' ? 'items-end' : 'items-start'
+      }`}
+    >
+      <div
+        className={`max-w-[92%] rounded-xl px-4 py-3 leading-relaxed ${
+          largeFont ? 'text-base' : 'text-sm'
+        } ${
+          msg.role === 'player'
+            ? 'bg-amber-500/20 border border-amber-500/35 text-amber-100'
+            : msg.role === 'error'
+            ? 'bg-rose-950/60 border border-rose-500/40 text-rose-200'
+            : 'bg-slate-950/85 border border-slate-800 text-slate-200'
+        }`}
+      >
+        <div className="flex items-center justify-between gap-3 mb-1.5 text-[11px] font-mono opacity-70">
+          <span className="uppercase font-bold">
+            {msg.role === 'player'
+              ? 'Jugador'
+              : msg.role === 'error'
+              ? 'Error'
+              : 'Dungeon Master'}
+          </span>
+          <span>{msg.timestamp}</span>
+        </div>
+
+        {msg.role === 'dm' ? (
+          <div
+            className={`prose prose-invert max-w-none space-y-2 leading-relaxed ${
+              largeFont ? 'prose-base' : 'prose-sm'
+            }`}
+          >
+            <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
+              {msg.content || '...'}
+            </ReactMarkdown>
+          </div>
+        ) : (
+          <p className="whitespace-pre-wrap">{msg.content}</p>
+        )}
+      </div>
+    </div>
+  );
+});
 
 const QUICK_MACROS = [
   {
@@ -47,7 +112,7 @@ const QUICK_MACROS = [
     icon: Dices,
     newSession: true,
     prompt:
-      'Inicia la sesión leyendo las directivas en 00_Sistema/ (Dungeon_Master.md, Motor_Reglas_5e.md, Protocolo_Archivos_DM.md), las fichas en Personajes/ y la sesión activa en Campaña/Sesiones/. Presenta el resumen inicial y la escena actual.',
+      'Inicia la sesión leyendo las directivas en 00_Sistema/ (Dungeon_Master.md, Motor_Reglas_5e.md, Protocolo_Archivos_DM.md), las fichas en Personajes/ y la sesión activa en Sesiones/ de la campaña activa. Presenta el resumen inicial y la escena actual.',
   },
   {
     id: 'initiative',
@@ -79,18 +144,20 @@ const QUICK_MACROS = [
     icon: Flag,
     newSession: false,
     prompt:
-      'Cierra la sesión actual: genera el bloque [!summary] en ## 🏁 Cierre de Sesión, sincroniza el estado final de todas las fichas en Personajes/ y actualiza Campaña/Tramas_Activas.md si corresponde.',
+      'Cierra la sesión actual: genera el bloque [!summary] en ## 🏁 Cierre de Sesión, sincroniza el estado final de todas las fichas en Personajes/ y actualiza Tramas_Activas.md de la campaña activa si corresponde.',
   },
 ] as const;
 
-export const DmChatPanel: React.FC<DmChatPanelProps> = ({
+export const DmChatPanel: React.FC<DmChatPanelProps> = React.memo(({
   messages,
   isProcessing,
   activeToolLabel,
   conversationId,
+  activeCampaign,
   isOpen,
   onToggleOpen,
   onSendPrompt,
+  onRefreshContext,
   onResetSession,
   onAbort,
 }) => {
@@ -101,9 +168,11 @@ export const DmChatPanel: React.FC<DmChatPanelProps> = ({
 
   useEffect(() => {
     if (isOpen) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      messagesEndRef.current?.scrollIntoView({
+        behavior: isProcessing ? 'auto' : 'smooth',
+      });
     }
-  }, [messages, activeToolLabel, isOpen]);
+  }, [messages, activeToolLabel, isOpen, isProcessing]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -135,9 +204,10 @@ export const DmChatPanel: React.FC<DmChatPanelProps> = ({
                   Consola del Dungeon Master
                 </h2>
                 <p className="text-[10px] font-mono text-slate-400 truncate">
+                  {activeCampaign ? `[${activeCampaign}] • ` : ''}
                   {conversationId
                     ? `Hilo activo: ${conversationId.slice(0, 12)}...`
-                    : 'Modo: Continuar última sesión (-c)'}
+                    : 'Modo: Continuar / Nueva sesión'}
                 </p>
               </div>
             </div>
@@ -170,9 +240,19 @@ export const DmChatPanel: React.FC<DmChatPanelProps> = ({
               </button>
               <button
                 type="button"
+                onClick={onRefreshContext}
+                disabled={isProcessing}
+                title="Refrescar hilo de IA (acelera respuestas conservando el chat visible y leyendo la escena desde Obsidian)"
+                className="px-2 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-emerald-300 hover:text-emerald-200 border border-slate-800 hover:border-emerald-500/40 text-[11px] font-medium flex items-center gap-1 disabled:opacity-40 transition-colors"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Refrescar hilo</span>
+              </button>
+              <button
+                type="button"
                 onClick={onResetSession}
                 disabled={isProcessing}
-                title="Reiniciar hilo de conversación"
+                title="Limpiar chat y reiniciar hilo"
                 className="p-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-amber-300 border border-slate-800 disabled:opacity-40"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
@@ -202,49 +282,7 @@ export const DmChatPanel: React.FC<DmChatPanelProps> = ({
               </div>
             ) : (
               messages.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`flex flex-col ${
-                    msg.role === 'player' ? 'items-end' : 'items-start'
-                  }`}
-                >
-                  <div
-                    className={`max-w-[92%] rounded-xl px-4 py-3 leading-relaxed ${
-                      largeFont ? 'text-base' : 'text-sm'
-                    } ${
-                      msg.role === 'player'
-                        ? 'bg-amber-500/20 border border-amber-500/35 text-amber-100'
-                        : msg.role === 'error'
-                        ? 'bg-rose-950/60 border border-rose-500/40 text-rose-200'
-                        : 'bg-slate-950/85 border border-slate-800 text-slate-200'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-3 mb-1.5 text-[11px] font-mono opacity-70">
-                      <span className="uppercase font-bold">
-                        {msg.role === 'player'
-                          ? 'Jugador'
-                          : msg.role === 'error'
-                          ? 'Error'
-                          : 'Dungeon Master'}
-                      </span>
-                      <span>{msg.timestamp}</span>
-                    </div>
-
-                    {msg.role === 'dm' ? (
-                      <div
-                        className={`prose prose-invert max-w-none space-y-2 leading-relaxed ${
-                          largeFont ? 'prose-base' : 'prose-sm'
-                        }`}
-                      >
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {msg.content || '...'}
-                        </ReactMarkdown>
-                      </div>
-                    ) : (
-                      <p className="whitespace-pre-wrap">{msg.content}</p>
-                    )}
-                  </div>
-                </div>
+                <ChatMessageBubble key={msg.id} msg={msg} largeFont={largeFont} />
               ))
             )}
 
@@ -348,5 +386,5 @@ export const DmChatPanel: React.FC<DmChatPanelProps> = ({
       </button>
     </div>
   );
-};
+});
 

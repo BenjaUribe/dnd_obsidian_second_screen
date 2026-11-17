@@ -296,6 +296,8 @@ export interface WorldMapGraph {
 
 export interface VaultState {
   vaultPath: string;
+  campaigns: string[];
+  activeCampaign: string;
   lastUpdated: string;
   lastChangedFile?: string;
   characters: CharacterSheet[];

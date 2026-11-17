@@ -7,6 +7,7 @@ import {
   ShieldAlert,
   Sparkles,
   Map,
+  FolderKanban,
 } from 'lucide-react';
 import { VaultState } from './types';
 import { PartyPanel } from './components/PartyPanel';
@@ -32,6 +33,8 @@ export const App: React.FC = () => {
   const [dmProcessing, setDmProcessing] = useState<boolean>(false);
   const [dmToolLabel, setDmToolLabel] = useState<string | null>(null);
   const [dmConversationId, setDmConversationId] = useState<string | null>(null);
+  const [dmForceNewSession, setDmForceNewSession] = useState<boolean>(false);
+  const [dmRehydrateContext, setDmRehydrateContext] = useState<boolean>(false);
 
   const nowTime = () =>
     new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -42,28 +45,34 @@ export const App: React.FC = () => {
     return () => clearTimeout(timer);
   }, []);
 
-  const fetchInitialVault = useCallback(async () => {
-    try {
-      const res = await fetch('/api/vault');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data: VaultState = await res.json();
-      setVault(data);
-      setError(null);
-      triggerFlash();
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : 'No se pudo conectar con el servidor de la bóveda.'
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [triggerFlash]);
+  const fetchVault = useCallback(
+    async (campaign?: string) => {
+      try {
+        const query = campaign
+          ? `?campaign=${encodeURIComponent(campaign)}`
+          : '';
+        const res = await fetch(`/api/vault${query}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data: VaultState = await res.json();
+        setVault(data);
+        setError(null);
+        triggerFlash();
+      } catch (err) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : 'No se pudo conectar con el servidor de la bóveda.'
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    [triggerFlash]
+  );
 
   // Carga inicial + suscripción SSE en vivo (bóveda + streaming del DM)
   useEffect(() => {
-    fetchInitialVault();
+    fetchVault();
 
     fetch('/api/dm/status')
       .then((r) => (r.ok ? r.json() : null))
@@ -170,9 +179,66 @@ export const App: React.FC = () => {
     return () => {
       eventSource.close();
     };
-  }, [fetchInitialVault, triggerFlash]);
+  }, [fetchVault, triggerFlash]);
 
-  const handleSendDmPrompt = async (prompt: string, newSession = false) => {
+  const handleResetDmSession = useCallback(async () => {
+    try {
+      await fetch('/api/dm/reset', { method: 'POST' });
+    } catch {
+      // Ignorar
+    } finally {
+      setDmConversationId(null);
+      setDmMessages([]);
+      setDmForceNewSession(true);
+      setDmRehydrateContext(false);
+    }
+  }, []);
+
+  const handleRefreshDmContext = useCallback(async () => {
+    try {
+      await fetch('/api/dm/reset', { method: 'POST' });
+    } catch {
+      // Ignorar
+    } finally {
+      setDmConversationId(null);
+      setDmForceNewSession(true);
+      setDmRehydrateContext(true);
+      setDmMessages((prev) => [
+        ...prev,
+        {
+          id: `sys-${Date.now()}`,
+          role: 'system',
+          content:
+            '⚡ Hilo de IA refrescado para mayor velocidad. El próximo mensaje retomará la escena desde Obsidian.',
+          timestamp: nowTime(),
+        },
+      ]);
+    }
+  }, []);
+
+  const handleCampaignChange = async (newCampaign: string) => {
+    if (!newCampaign || newCampaign === vault?.activeCampaign) return;
+    setSelectedEntity(null);
+    await Promise.all([
+      fetchVault(newCampaign),
+      handleResetDmSession(),
+    ]);
+  };
+
+  const handleSendDmPrompt = useCallback(async (prompt: string, newSession = false) => {
+    const startAsNewSession = newSession || dmForceNewSession;
+    const shouldRehydrate = dmRehydrateContext && !newSession;
+    if (dmForceNewSession) {
+      setDmForceNewSession(false);
+    }
+    if (dmRehydrateContext) {
+      setDmRehydrateContext(false);
+    }
+
+    const effectivePrompt = shouldRehydrate
+      ? `Retoma la escena actual leyendo brevemente la sesión activa en Sesiones/ y las fichas en Personajes/ de la campaña activa antes de responder. Acción del jugador: ${prompt}`
+      : prompt;
+
     setIsDmChatOpen(true);
     setDmMessages((prev) => [
       ...prev,
@@ -188,7 +254,11 @@ export const App: React.FC = () => {
       const res = await fetch('/api/dm/prompt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, newSession }),
+        body: JSON.stringify({
+          prompt: effectivePrompt,
+          newSession: startAsNewSession,
+          campaign: vault?.activeCampaign,
+        }),
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
@@ -216,19 +286,9 @@ export const App: React.FC = () => {
         },
       ]);
     }
-  };
+  }, [dmForceNewSession, dmRehydrateContext, vault?.activeCampaign]);
 
-  const handleResetDmSession = async () => {
-    try {
-      await fetch('/api/dm/reset', { method: 'POST' });
-      setDmConversationId(null);
-      setDmMessages([]);
-    } catch {
-      // Ignorar
-    }
-  };
-
-  const handleAbortDm = async () => {
+  const handleAbortDm = useCallback(async () => {
     try {
       await fetch('/api/dm/abort', { method: 'POST' });
       setDmProcessing(false);
@@ -236,7 +296,11 @@ export const App: React.FC = () => {
     } catch {
       // Ignorar
     }
-  };
+  }, []);
+
+  const handleToggleDmChat = useCallback(() => {
+    setIsDmChatOpen((prev) => !prev);
+  }, []);
 
   // Atajo global Ctrl + K para abrir el buscador rápido y ESC para cerrar modales
   useEffect(() => {
@@ -275,7 +339,7 @@ export const App: React.FC = () => {
           <p className="text-xs text-slate-400">{error}</p>
           <button
             type="button"
-            onClick={fetchInitialVault}
+            onClick={() => fetchVault()}
             className="px-4 py-2 rounded-lg bg-amber-500 text-slate-950 font-semibold text-xs hover:bg-amber-400 transition-colors"
           >
             Reintentar conexión
@@ -340,6 +404,42 @@ export const App: React.FC = () => {
                 <span>Reglas 5e</span>
               </button>
             )}
+
+            {/* Selector de Campaña Activa */}
+            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-slate-900 border border-slate-700/90 hover:border-amber-500/40 transition-colors">
+              <FolderKanban className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              <label htmlFor="campaign-selector" className="sr-only">
+                Campaña activa
+              </label>
+              <select
+                id="campaign-selector"
+                value={vault.activeCampaign || ''}
+                onChange={(e) => handleCampaignChange(e.target.value)}
+                disabled={!vault.campaigns || vault.campaigns.length === 0}
+                title={
+                  vault.activeCampaign
+                    ? `Campaña activa: Campañas/${vault.activeCampaign}`
+                    : 'No se encontraron campañas en Campañas/'
+                }
+                className="bg-transparent text-xs font-medium text-amber-200 focus:outline-none cursor-pointer pr-1 max-w-[180px] sm:max-w-[220px] truncate"
+              >
+                {vault.campaigns && vault.campaigns.length > 0 ? (
+                  vault.campaigns.map((camp) => (
+                    <option
+                      key={camp}
+                      value={camp}
+                      className="bg-slate-900 text-slate-100"
+                    >
+                      {camp.replace(/_/g, ' ')}
+                    </option>
+                  ))
+                ) : (
+                  <option value="" className="bg-slate-900 text-slate-400">
+                    Sin campañas
+                  </option>
+                )}
+              </select>
+            </div>
 
             {/* Indicador de Estado de Conexión con Destello en Vivo */}
             <div
@@ -467,9 +567,11 @@ export const App: React.FC = () => {
         isProcessing={dmProcessing}
         activeToolLabel={dmToolLabel}
         conversationId={dmConversationId}
+        activeCampaign={vault.activeCampaign}
         isOpen={isDmChatOpen}
-        onToggleOpen={() => setIsDmChatOpen((prev) => !prev)}
+        onToggleOpen={handleToggleDmChat}
         onSendPrompt={handleSendDmPrompt}
+        onRefreshContext={handleRefreshDmContext}
         onResetSession={handleResetDmSession}
         onAbort={handleAbortDm}
       />
